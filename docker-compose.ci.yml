@@ -1,0 +1,22 @@
+# docker-compose.ci.yml
+#
+# Override file used only by the integration-test job in CI. It
+# swaps `build:` sections for pre-built `:latest` images that the
+# build stage produced, so the integration test reuses the exact
+# binaries that will ship to production rather than rebuilding
+# from source.
+#
+# Usage (from the repo root):
+#     docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --wait
+services:
+  api:
+    build: !reset null
+    image: hng-api:latest
+
+  worker:
+    build: !reset null
+    image: hng-worker:latest
+
+  frontend:
+    build: !reset null
+    image: hng-frontend:latest

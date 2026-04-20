@@ -337,3 +337,88 @@ jobs:
           name: trivy-sarif-${{ matrix.image }}
           path: trivy-${{ matrix.image }}.sarif
           retention-days: 14
+
+  # ---------------------------------------------------------------
+  # Stage 5: integration-test
+  # ---------------------------------------------------------------
+  # Brings the full stack up using the images built in the build
+  # stage (not a rebuild), submits a real job via the frontend,
+  # polls the api until the worker marks it completed, and tears
+  # the stack down in `if: always()` so nothing leaks between runs.
+  integration-test:
+    name: integration-test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    env:
+      COMPOSE_FILES: "-f docker-compose.yml -f docker-compose.ci.yml"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: |
+          docker load -i images.tar
+          docker images
+
+      # The compose file uses ${VAR:?...} for REDIS_PASSWORD, so a
+      # .env with a throwaway value is required before `up`.
+      - name: Create ephemeral .env from example
+        run: |
+          cp .env.example .env
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=ci-$(openssl rand -hex 12)|" .env
+
+      - name: Bring up stack and wait for healthchecks
+        run: |
+          docker compose ${COMPOSE_FILES} up -d --wait --wait-timeout 120
+          docker compose ${COMPOSE_FILES} ps
+
+      - name: Submit a job and poll until completed
+        run: |
+          set -euo pipefail
+          FRONTEND="http://localhost:${FRONTEND_PORT:-3000}"
+
+          echo "submitting job..."
+          JOB_ID=$(curl -fsS -X POST "${FRONTEND}/submit" | jq -r .job_id)
+          echo "job_id=${JOB_ID}"
+          [ -n "${JOB_ID}" ] && [ "${JOB_ID}" != "null" ] || { echo "no job id" >&2; exit 1; }
+
+          echo "polling /status/${JOB_ID}..."
+          for i in $(seq 1 60); do
+            STATUS=$(curl -fsS "${FRONTEND}/status/${JOB_ID}" | jq -r .status)
+            echo "  attempt ${i}: status=${STATUS}"
+            case "${STATUS}" in
+              completed) echo "OK"; exit 0 ;;
+              failed|error) echo "job ended in terminal error state" >&2; exit 1 ;;
+            esac
+            sleep 2
+          done
+          echo "timed out after 120s waiting for job to complete" >&2
+          exit 1
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          for svc in redis api worker frontend; do
+            docker compose ${COMPOSE_FILES} logs --no-color "${svc}" \
+              > "ci-logs/${svc}.log" 2>&1 || true
+          done
+          docker compose ${COMPOSE_FILES} ps > ci-logs/ps.txt || true
+
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: ci-logs/
+          retention-days: 7
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose ${COMPOSE_FILES} down -v --remove-orphans
