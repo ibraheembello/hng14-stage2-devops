@@ -1,0 +1,95 @@
+# .github/workflows/ci.yml
+#
+# Single workflow containing all six CI/CD stages. Stages run in a
+# strict order enforced by `needs:` — if any earlier stage fails, all
+# later stages are skipped.
+#
+#   lint -> test -> build -> security-scan -> integration-test -> deploy
+#
+# Only the deploy job runs on pushes to main; every other job also
+# runs on pull requests.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel older runs for the same branch/PR when a new commit arrives.
+# Saves free-tier minutes and prevents stale runs from deploying.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default. Individual jobs opt in to more as needed
+# (e.g. the security-scan job needs security-events: write to upload
+# SARIF results).
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # Stage 1: lint
+  # ---------------------------------------------------------------
+  # Catches style and syntax mistakes cheaply before the heavier
+  # test/build/scan stages spend runner minutes on them.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+
+      - name: Install flake8 and yamllint
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8==7.1.1 yamllint==1.35.1
+
+      - name: Lint python (api and worker)
+        run: |
+          flake8 api worker \
+            --exclude=.venv,__pycache__,.pytest_cache \
+            --max-line-length=100 \
+            --extend-ignore=E203,W503
+
+      - name: Lint YAML (compose + workflows)
+        run: |
+          yamllint -c .yamllint docker-compose.yml .github/workflows
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check frontend JS
+        run: node --check frontend/app.js
+
+      # hadolint-action runs inside a container and accepts per-file
+      # invocations. We loop in a matrix-free step for simplicity.
+      - name: Lint Dockerfile — api
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+          config: .github/hadolint.yaml
+
+      - name: Lint Dockerfile — worker
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+          config: .github/hadolint.yaml
+
+      - name: Lint Dockerfile — frontend
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+          config: .github/hadolint.yaml
