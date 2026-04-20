@@ -9,6 +9,10 @@ const PORT = parseInt(process.env.FRONTEND_PORT || process.env.PORT || '3000', 1
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'views')));
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.post('/submit', async (req, res) => {
   try {
     const response = await axios.post(`${API_URL}/jobs`);
