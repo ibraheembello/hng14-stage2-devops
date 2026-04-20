@@ -257,3 +257,83 @@ jobs:
           path: images.tar
           retention-days: 1
           compression-level: 0  # Docker layers are already compressed
+
+  # ---------------------------------------------------------------
+  # Stage 4: security-scan
+  # ---------------------------------------------------------------
+  # Runs Trivy against each image built in the previous stage. Fails
+  # the job on any CRITICAL finding (task requirement) and uploads
+  # SARIF results as both an artifact and to GitHub's Security tab.
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      # Needed for github/codeql-action/upload-sarif to write findings
+      # to the repo's Security tab.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      # Scan every image, even if one fails, so the SARIF report is
+      # complete. The CRITICAL gate still fails the job overall.
+      fail-fast: false
+      matrix:
+        image:
+          - hng-api
+          - hng-worker
+          - hng-frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: |
+          docker load -i images.tar
+          docker images
+
+      # Blocking scan: fail the job on any CRITICAL finding.
+      - name: Trivy scan — CRITICAL gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      # Informational scan: include HIGH + CRITICAL and emit SARIF for
+      # the Security tab. Does not fail the job on HIGH because only
+      # CRITICAL is gated per task spec.
+      - name: Trivy scan — SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}
+
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif-${{ matrix.image }}
+          path: trivy-${{ matrix.image }}.sarif
+          retention-days: 14
