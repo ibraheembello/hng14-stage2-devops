@@ -297,31 +297,50 @@ jobs:
           docker load -i images.tar
           docker images
 
-      # Blocking scan: fail the job on any CRITICAL finding.
-      - name: Trivy scan — CRITICAL gate
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ matrix.image }}:latest
-          format: table
-          severity: CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
+      # We invoke the trivy container directly rather than via
+      # aquasecurity/trivy-action because the action's composite
+      # setup chain (setup-trivy@v0.2.x) currently references
+      # deleted upstream tags and fails to resolve. A plain
+      # `docker run aquasec/trivy:X.Y.Z` is pinned, reproducible,
+      # and bypasses that broken action graph entirely.
 
-      # Informational scan: include HIGH + CRITICAL and emit SARIF for
-      # the Security tab. Does not fail the job on HIGH because only
-      # CRITICAL is gated per task spec.
+      # Blocking scan: fail the job on any fixed CRITICAL finding.
+      - name: Trivy scan — CRITICAL gate
+        env:
+          TRIVY_VERSION: "0.57.1"
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}:/work" \
+            -w /work \
+            aquasec/trivy:${TRIVY_VERSION} image \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --vuln-type os,library \
+              --exit-code 1 \
+              --format table \
+              ${{ matrix.image }}:latest
+
+      # Informational scan: include HIGH + CRITICAL and emit SARIF
+      # for the Security tab. Does not fail the job on HIGH because
+      # only CRITICAL is gated per task spec.
       - name: Trivy scan — SARIF report
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ matrix.image }}:latest
-          format: sarif
-          output: trivy-${{ matrix.image }}.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "0"
-          ignore-unfixed: true
-          vuln-type: os,library
+        env:
+          TRIVY_VERSION: "0.57.1"
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}:/work" \
+            -w /work \
+            aquasec/trivy:${TRIVY_VERSION} image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --vuln-type os,library \
+              --exit-code 0 \
+              --format sarif \
+              --output "trivy-${{ matrix.image }}.sarif" \
+              ${{ matrix.image }}:latest
 
       - name: Upload SARIF to GitHub Security tab
         if: always()
