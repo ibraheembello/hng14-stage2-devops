@@ -422,3 +422,93 @@ jobs:
         if: always()
         run: |
           docker compose ${COMPOSE_FILES} down -v --remove-orphans
+
+  # ---------------------------------------------------------------
+  # Stage 6: deploy
+  # ---------------------------------------------------------------
+  # Runs only on pushes to main, after every other stage has passed.
+  # Performs a scripted rolling update of each service using
+  # scripts/rolling-deploy.sh. The deploy target is the runner
+  # itself (free-tier friendly); the same script would drive a real
+  # server over SSH in production.
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      SHA_TAG: ${{ github.sha }}
+      NETWORK: appnet
+      HEALTH_TIMEOUT: "60"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: docker load -i images.tar
+
+      - name: Create .env from example (throwaway for this demo deploy)
+        run: |
+          cp .env.example .env
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=deploy-$(openssl rand -hex 12)|" .env
+
+      - name: Create shared network and start dependency (redis)
+        run: |
+          docker network create "${NETWORK}" || true
+          # Redis runs as a stable long-lived container; only app
+          # services are rolling-updated.
+          if ! docker ps --format '{{.Names}}' | grep -qx redis; then
+            docker run -d \
+              --name redis \
+              --network "${NETWORK}" \
+              --env-file .env \
+              redis:7-alpine \
+              redis-server --requirepass "$(grep ^REDIS_PASSWORD .env | cut -d= -f2)" --appendonly yes
+          fi
+
+      - name: Seed "old" versions (simulate a running prior deploy)
+        run: |
+          # In a real environment the old container is already running.
+          # For the demo we seed it with the same image so the script
+          # has something to replace.
+          for svc in api worker frontend; do
+            if ! docker ps --format '{{.Names}}' | grep -qx "${svc}"; then
+              docker run -d \
+                --name "${svc}" \
+                --network "${NETWORK}" \
+                --env-file .env \
+                "hng-${svc}:latest" >/dev/null
+            fi
+          done
+          sleep 5  # let healthchecks start reporting
+
+      - name: Make deploy script executable
+        run: chmod +x scripts/rolling-deploy.sh
+
+      - name: Rolling-update api
+        run: ./scripts/rolling-deploy.sh api "hng-api:${SHA_TAG}"
+
+      - name: Rolling-update worker
+        run: ./scripts/rolling-deploy.sh worker "hng-worker:${SHA_TAG}"
+
+      - name: Rolling-update frontend
+        run: ./scripts/rolling-deploy.sh frontend "hng-frontend:${SHA_TAG}"
+
+      - name: Verify all services are healthy after deploy
+        run: |
+          for svc in api worker frontend; do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' "${svc}")
+            echo "${svc}: ${STATUS}"
+            [ "${STATUS}" = "healthy" ] || exit 1
+          done
+
+      - name: Tear down demo deploy
+        if: always()
+        run: |
+          docker rm -f api worker frontend redis api-new worker-new frontend-new 2>/dev/null || true
+          docker network rm "${NETWORK}" 2>/dev/null || true
