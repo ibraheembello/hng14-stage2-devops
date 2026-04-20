@@ -46,5 +46,8 @@ trivy-results.json
 .DS_Store
 Thumbs.db
 
+# ---- Claude Code session artifacts ----
+.claude/
+
 # ---- Docker local state (not images — those live in the daemon) ----
 *.log
