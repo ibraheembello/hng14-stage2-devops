@@ -1,0 +1,17 @@
+.env
+.env.*
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+Dockerfile
+.dockerignore
+
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
