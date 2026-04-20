@@ -1,0 +1,15 @@
+.env
+.env.*
+
+node_modules/
+npm-debug.log
+yarn-error.log
+
+Dockerfile
+.dockerignore
+
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
