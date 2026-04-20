@@ -299,7 +299,7 @@ jobs:
 
       # Blocking scan: fail the job on any CRITICAL finding.
       - name: Trivy scan — CRITICAL gate
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.29.0
         with:
           image-ref: ${{ matrix.image }}:latest
           format: table
@@ -313,7 +313,7 @@ jobs:
       # CRITICAL is gated per task spec.
       - name: Trivy scan — SARIF report
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.29.0
         with:
           image-ref: ${{ matrix.image }}:latest
           format: sarif
