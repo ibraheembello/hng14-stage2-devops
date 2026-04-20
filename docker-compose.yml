@@ -1,0 +1,125 @@
+# docker-compose.yml
+#
+# Full stack for the job-processing app: redis, api, worker, frontend.
+#
+# Key rules enforced by this file:
+#   * Every service joins a single named internal network (appnet).
+#   * Redis is NOT exposed to the host - no 'ports:' entry.
+#   * Every service has a healthcheck, and dependents wait on
+#     condition: service_healthy, not just start.
+#   * Every value is sourced from environment variables. ${VAR:?msg}
+#     fails 'docker compose up' with a clear error when a required
+#     variable is missing; ${VAR:-default} supplies a sensible default.
+#   * Every service declares CPU and memory limits.
+name: hng-stage2
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Password is required. Using ":?" makes compose refuse to start
+    # without it. AOF persistence keeps queued jobs across restarts.
+    command:
+      - redis-server
+      - --requirepass
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"
+      - --appendonly
+      - "yes"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep -q PONG'
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - appnet
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  api:
+    build:
+      context: ./api
+    image: hng-api:local
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: "${REDIS_HOST:-redis}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"
+      APP_ENV: "${APP_ENV:-production}"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    networks:
+      - appnet
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.2"
+          memory: 128M
+
+  worker:
+    build:
+      context: ./worker
+    image: hng-worker:local
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: "${REDIS_HOST:-redis}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"
+      WORKER_HEARTBEAT_INTERVAL: "${WORKER_HEARTBEAT_INTERVAL:-10}"
+    networks:
+      - appnet
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  frontend:
+    build:
+      context: ./frontend
+    image: hng-frontend:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_URL: "${API_URL:-http://api:8000}"
+      FRONTEND_PORT: "${FRONTEND_PORT:-3000}"
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    networks:
+      - appnet
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+networks:
+  appnet:
+    driver: bridge
