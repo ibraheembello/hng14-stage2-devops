@@ -1,0 +1,30 @@
+# Never ship secrets in the image
+.env
+.env.*
+
+# Python build/test artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Dev-only requirements file and tests (they should never land in the
+# production image). CI installs them separately from the host.
+requirements-dev.txt
+tests/
+
+# Docker metadata itself
+Dockerfile
+.dockerignore
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
