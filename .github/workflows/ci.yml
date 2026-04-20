@@ -1,0 +1,514 @@
+# .github/workflows/ci.yml
+#
+# Single workflow containing all six CI/CD stages. Stages run in a
+# strict order enforced by `needs:` — if any earlier stage fails, all
+# later stages are skipped.
+#
+#   lint -> test -> build -> security-scan -> integration-test -> deploy
+#
+# Only the deploy job runs on pushes to main; every other job also
+# runs on pull requests.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel older runs for the same branch/PR when a new commit arrives.
+# Saves free-tier minutes and prevents stale runs from deploying.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default. Individual jobs opt in to more as needed
+# (e.g. the security-scan job needs security-events: write to upload
+# SARIF results).
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # Stage 1: lint
+  # ---------------------------------------------------------------
+  # Catches style and syntax mistakes cheaply before the heavier
+  # test/build/scan stages spend runner minutes on them.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+
+      - name: Install flake8 and yamllint
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8==7.1.1 yamllint==1.35.1
+
+      - name: Lint python (api and worker)
+        run: |
+          flake8 api worker \
+            --exclude=.venv,__pycache__,.pytest_cache \
+            --max-line-length=100 \
+            --extend-ignore=E203,W503
+
+      - name: Lint YAML (compose + workflows)
+        run: |
+          yamllint -c .yamllint docker-compose.yml .github/workflows
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check frontend JS
+        run: node --check frontend/app.js
+
+      # hadolint-action runs inside a container and accepts per-file
+      # invocations. We loop in a matrix-free step for simplicity.
+      - name: Lint Dockerfile — api
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+          config: .github/hadolint.yaml
+
+      - name: Lint Dockerfile — worker
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+          config: .github/hadolint.yaml
+
+      - name: Lint Dockerfile — frontend
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+          config: .github/hadolint.yaml
+
+  # ---------------------------------------------------------------
+  # Stage 2: test
+  # ---------------------------------------------------------------
+  # Runs the api pytest suite with coverage. Redis is mocked via
+  # fakeredis (see api/conftest.py) so this job needs no service
+  # containers and finishes in seconds.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: lint
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+
+      - name: Install api + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        run: |
+          pytest \
+            --cov=main \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=junit.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            api/coverage.xml
+            api/junit.xml
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # Stage 3: build
+  # ---------------------------------------------------------------
+  # Builds each service image, tags it with both the git SHA and
+  # `latest`, and pushes to a Docker registry running as a service
+  # container alongside the job. The registry is local to the runner
+  # and dies with the job; downstream stages receive the images via
+  # `docker save` -> artifact -> `docker load`.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: test
+    # A service container lives alongside the job's steps. The
+    # registry listens on localhost:5000 from the job's perspective.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      REGISTRY: localhost:5000
+      SHA_TAG: ${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # The default docker driver cannot push to insecure local
+          # registries; the "docker-container" driver (default for
+          # buildx) can, and also gives us better layer caching.
+          driver-opts: |
+            network=host
+
+      - name: Wait for local registry to be ready
+        run: |
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:5000/v2/ >/dev/null; then
+              echo "registry ready"; exit 0
+            fi
+            echo "waiting for registry ($i/20)..."; sleep 2
+          done
+          echo "registry never became ready" >&2
+          exit 1
+
+      - name: Build and push — api
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/hng-api:${{ env.SHA_TAG }}
+            ${{ env.REGISTRY }}/hng-api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build and push — worker
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/hng-worker:${{ env.SHA_TAG }}
+            ${{ env.REGISTRY }}/hng-worker:latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+
+      - name: Build and push — frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/hng-frontend:${{ env.SHA_TAG }}
+            ${{ env.REGISTRY }}/hng-frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      # Save the three images to a tar archive so downstream jobs can
+      # load them without re-running the registry. We pull them back
+      # from the local registry (rather than using buildx's local
+      # output) to prove the round-trip worked.
+      - name: Pull images from local registry
+        run: |
+          docker pull "${REGISTRY}/hng-api:${SHA_TAG}"
+          docker pull "${REGISTRY}/hng-worker:${SHA_TAG}"
+          docker pull "${REGISTRY}/hng-frontend:${SHA_TAG}"
+
+      - name: Retag images with short names for downstream jobs
+        run: |
+          docker tag "${REGISTRY}/hng-api:${SHA_TAG}"      hng-api:${SHA_TAG}
+          docker tag "${REGISTRY}/hng-worker:${SHA_TAG}"   hng-worker:${SHA_TAG}
+          docker tag "${REGISTRY}/hng-frontend:${SHA_TAG}" hng-frontend:${SHA_TAG}
+          docker tag "${REGISTRY}/hng-api:${SHA_TAG}"      hng-api:latest
+          docker tag "${REGISTRY}/hng-worker:${SHA_TAG}"   hng-worker:latest
+          docker tag "${REGISTRY}/hng-frontend:${SHA_TAG}" hng-frontend:latest
+
+      - name: Save images to tar
+        run: |
+          docker save \
+            hng-api:${SHA_TAG} hng-api:latest \
+            hng-worker:${SHA_TAG} hng-worker:latest \
+            hng-frontend:${SHA_TAG} hng-frontend:latest \
+            -o images.tar
+          ls -lh images.tar
+
+      - name: Upload images artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: images.tar
+          retention-days: 1
+          compression-level: 0  # Docker layers are already compressed
+
+  # ---------------------------------------------------------------
+  # Stage 4: security-scan
+  # ---------------------------------------------------------------
+  # Runs Trivy against each image built in the previous stage. Fails
+  # the job on any CRITICAL finding (task requirement) and uploads
+  # SARIF results as both an artifact and to GitHub's Security tab.
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      # Needed for github/codeql-action/upload-sarif to write findings
+      # to the repo's Security tab.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      # Scan every image, even if one fails, so the SARIF report is
+      # complete. The CRITICAL gate still fails the job overall.
+      fail-fast: false
+      matrix:
+        image:
+          - hng-api
+          - hng-worker
+          - hng-frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: |
+          docker load -i images.tar
+          docker images
+
+      # Blocking scan: fail the job on any CRITICAL finding.
+      - name: Trivy scan — CRITICAL gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      # Informational scan: include HIGH + CRITICAL and emit SARIF for
+      # the Security tab. Does not fail the job on HIGH because only
+      # CRITICAL is gated per task spec.
+      - name: Trivy scan — SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}
+
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif-${{ matrix.image }}
+          path: trivy-${{ matrix.image }}.sarif
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # Stage 5: integration-test
+  # ---------------------------------------------------------------
+  # Brings the full stack up using the images built in the build
+  # stage (not a rebuild), submits a real job via the frontend,
+  # polls the api until the worker marks it completed, and tears
+  # the stack down in `if: always()` so nothing leaks between runs.
+  integration-test:
+    name: integration-test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    env:
+      COMPOSE_FILES: "-f docker-compose.yml -f docker-compose.ci.yml"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: |
+          docker load -i images.tar
+          docker images
+
+      # The compose file uses ${VAR:?...} for REDIS_PASSWORD, so a
+      # .env with a throwaway value is required before `up`.
+      - name: Create ephemeral .env from example
+        run: |
+          cp .env.example .env
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=ci-$(openssl rand -hex 12)|" .env
+
+      - name: Bring up stack and wait for healthchecks
+        run: |
+          docker compose ${COMPOSE_FILES} up -d --wait --wait-timeout 120
+          docker compose ${COMPOSE_FILES} ps
+
+      - name: Submit a job and poll until completed
+        run: |
+          set -euo pipefail
+          FRONTEND="http://localhost:${FRONTEND_PORT:-3000}"
+
+          echo "submitting job..."
+          JOB_ID=$(curl -fsS -X POST "${FRONTEND}/submit" | jq -r .job_id)
+          echo "job_id=${JOB_ID}"
+          [ -n "${JOB_ID}" ] && [ "${JOB_ID}" != "null" ] || { echo "no job id" >&2; exit 1; }
+
+          echo "polling /status/${JOB_ID}..."
+          for i in $(seq 1 60); do
+            STATUS=$(curl -fsS "${FRONTEND}/status/${JOB_ID}" | jq -r .status)
+            echo "  attempt ${i}: status=${STATUS}"
+            case "${STATUS}" in
+              completed) echo "OK"; exit 0 ;;
+              failed|error) echo "job ended in terminal error state" >&2; exit 1 ;;
+            esac
+            sleep 2
+          done
+          echo "timed out after 120s waiting for job to complete" >&2
+          exit 1
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          for svc in redis api worker frontend; do
+            docker compose ${COMPOSE_FILES} logs --no-color "${svc}" \
+              > "ci-logs/${svc}.log" 2>&1 || true
+          done
+          docker compose ${COMPOSE_FILES} ps > ci-logs/ps.txt || true
+
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: ci-logs/
+          retention-days: 7
+
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose ${COMPOSE_FILES} down -v --remove-orphans
+
+  # ---------------------------------------------------------------
+  # Stage 6: deploy
+  # ---------------------------------------------------------------
+  # Runs only on pushes to main, after every other stage has passed.
+  # Performs a scripted rolling update of each service using
+  # scripts/rolling-deploy.sh. The deploy target is the runner
+  # itself (free-tier friendly); the same script would drive a real
+  # server over SSH in production.
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      SHA_TAG: ${{ github.sha }}
+      NETWORK: appnet
+      HEALTH_TIMEOUT: "60"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load images into docker
+        run: docker load -i images.tar
+
+      - name: Create .env from example (throwaway for this demo deploy)
+        run: |
+          cp .env.example .env
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=deploy-$(openssl rand -hex 12)|" .env
+
+      - name: Create shared network and start dependency (redis)
+        run: |
+          docker network create "${NETWORK}" || true
+          # Redis runs as a stable long-lived container; only app
+          # services are rolling-updated.
+          if ! docker ps --format '{{.Names}}' | grep -qx redis; then
+            docker run -d \
+              --name redis \
+              --network "${NETWORK}" \
+              --env-file .env \
+              redis:7-alpine \
+              redis-server --requirepass "$(grep ^REDIS_PASSWORD .env | cut -d= -f2)" --appendonly yes
+          fi
+
+      - name: Seed "old" versions (simulate a running prior deploy)
+        run: |
+          # In a real environment the old container is already running.
+          # For the demo we seed it with the same image so the script
+          # has something to replace.
+          for svc in api worker frontend; do
+            if ! docker ps --format '{{.Names}}' | grep -qx "${svc}"; then
+              docker run -d \
+                --name "${svc}" \
+                --network "${NETWORK}" \
+                --env-file .env \
+                "hng-${svc}:latest" >/dev/null
+            fi
+          done
+          sleep 5  # let healthchecks start reporting
+
+      - name: Make deploy script executable
+        run: chmod +x scripts/rolling-deploy.sh
+
+      - name: Rolling-update api
+        run: ./scripts/rolling-deploy.sh api "hng-api:${SHA_TAG}"
+
+      - name: Rolling-update worker
+        run: ./scripts/rolling-deploy.sh worker "hng-worker:${SHA_TAG}"
+
+      - name: Rolling-update frontend
+        run: ./scripts/rolling-deploy.sh frontend "hng-frontend:${SHA_TAG}"
+
+      - name: Verify all services are healthy after deploy
+        run: |
+          for svc in api worker frontend; do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' "${svc}")
+            echo "${svc}: ${STATUS}"
+            [ "${STATUS}" = "healthy" ] || exit 1
+          done
+
+      - name: Tear down demo deploy
+        if: always()
+        run: |
+          docker rm -f api worker frontend redis api-new worker-new frontend-new 2>/dev/null || true
+          docker network rm "${NETWORK}" 2>/dev/null || true

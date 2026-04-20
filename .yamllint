@@ -1,0 +1,22 @@
+# yamllint config
+#
+# Relaxes two defaults for this repo:
+#   * line-length: docker-compose and Actions workflows often have long
+#     readable lines; 140 is a pragmatic cap.
+#   * truthy: GitHub Actions' top-level key is `on:` which default
+#     yamllint flags as a truthy-value misuse. Disabling key checks is
+#     safer than rewriting valid Actions syntax.
+extends: default
+
+rules:
+  line-length:
+    max: 140
+    level: warning
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  document-start: disable
+  # Don't care whether files are LF or CRLF. Authors on Windows and
+  # Linux both contribute; git normalizes to LF in the repo anyway.
+  new-lines: disable

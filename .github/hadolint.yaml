@@ -1,0 +1,15 @@
+# hadolint rule config
+#
+# hadolint audits Dockerfiles for common mistakes. We accept its
+# defaults and only silence rules that conflict with our conscious
+# choices:
+#   * DL3008 — warns when `apt-get install` doesn't pin versions.
+#     Not applicable: our images use python:3.12-slim and
+#     node:20-alpine without apt, so this never fires, but pinning
+#     it here documents the intent.
+ignored:
+  - DL3008
+
+# Treat style warnings as errors so CI fails on them — stricter than
+# the default where only security/correctness issues fail.
+failure-threshold: warning
