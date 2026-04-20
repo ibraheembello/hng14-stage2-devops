@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 
 import redis
@@ -16,6 +17,37 @@ r = redis.Redis(
     password=REDIS_PASSWORD,
     decode_responses=True,
 )
+
+
+@app.on_event("startup")
+def _wait_for_redis():
+    max_attempts = 10
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r.ping()
+            print(
+                f"[startup] connected to redis at {REDIS_HOST}:{REDIS_PORT}",
+                flush=True,
+            )
+            return
+        except redis.ConnectionError as exc:
+            print(
+                f"[startup] redis not ready ({attempt}/{max_attempts}): {exc}",
+                flush=True,
+            )
+            time.sleep(2)
+    raise RuntimeError("Redis unreachable after retries")
+
+
+@app.get("/health")
+def health():
+    try:
+        r.ping()
+    except redis.RedisError as exc:
+        raise HTTPException(
+            status_code=503, detail=f"redis unreachable: {exc}"
+        )
+    return {"status": "ok"}
 
 
 @app.post("/jobs")
