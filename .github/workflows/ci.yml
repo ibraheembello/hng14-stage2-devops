@@ -405,28 +405,14 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --wait --wait-timeout 120
           docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
 
-      - name: Submit a job and poll until completed
+      - name: Run integration test
+        env:
+          FRONTEND_URL: "http://localhost:${{ env.FRONTEND_PORT || 3000 }}"
+          INTEGRATION_TIMEOUT: "120"
+          POLL_INTERVAL: "2"
         run: |
-          set -euo pipefail
-          FRONTEND="http://localhost:${FRONTEND_PORT:-3000}"
-
-          echo "submitting job..."
-          JOB_ID=$(curl -fsS -X POST "${FRONTEND}/submit" | jq -r .job_id)
-          echo "job_id=${JOB_ID}"
-          [ -n "${JOB_ID}" ] && [ "${JOB_ID}" != "null" ] || { echo "no job id" >&2; exit 1; }
-
-          echo "polling /status/${JOB_ID}..."
-          for i in $(seq 1 60); do
-            STATUS=$(curl -fsS "${FRONTEND}/status/${JOB_ID}" | jq -r .status)
-            echo "  attempt ${i}: status=${STATUS}"
-            case "${STATUS}" in
-              completed) echo "OK"; exit 0 ;;
-              failed|error) echo "job ended in terminal error state" >&2; exit 1 ;;
-            esac
-            sleep 2
-          done
-          echo "timed out after 120s waiting for job to complete" >&2
-          exit 1
+          chmod +x scripts/integration-test.sh
+          bash scripts/integration-test.sh
 
       - name: Dump container logs on failure
         if: failure()
