@@ -391,11 +391,14 @@ jobs:
           docker images
 
       # The compose file uses ${VAR:?...} for REDIS_PASSWORD, so a
-      # .env with a throwaway value is required before `up`.
+      # .env with a value is required before `up`. The password is
+      # generated into a shell variable so no literal credential
+      # material appears in the workflow YAML.
       - name: Create ephemeral .env from example
         run: |
           cp .env.example .env
-          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=ci-$(openssl rand -hex 12)|" .env
+          GENERATED=$(openssl rand -hex 16)
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${GENERATED}|" .env
 
       - name: Bring up stack and wait for healthchecks
         run: |
@@ -481,7 +484,8 @@ jobs:
       - name: Create .env from example (throwaway for this demo deploy)
         run: |
           cp .env.example .env
-          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=deploy-$(openssl rand -hex 12)|" .env
+          GENERATED=$(openssl rand -hex 16)
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${GENERATED}|" .env
 
       - name: Create shared network and start dependency (redis)
         run: |
