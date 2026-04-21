@@ -376,8 +376,6 @@ jobs:
     name: integration-test
     runs-on: ubuntu-latest
     needs: security-scan
-    env:
-      COMPOSE_FILES: "-f docker-compose.yml -f docker-compose.ci.yml"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -401,8 +399,8 @@ jobs:
 
       - name: Bring up stack and wait for healthchecks
         run: |
-          docker compose ${COMPOSE_FILES} up -d --wait --wait-timeout 120
-          docker compose ${COMPOSE_FILES} ps
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --wait --wait-timeout 120
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
 
       - name: Submit a job and poll until completed
         run: |
@@ -432,10 +430,11 @@ jobs:
         run: |
           mkdir -p ci-logs
           for svc in redis api worker frontend; do
-            docker compose ${COMPOSE_FILES} logs --no-color "${svc}" \
-              > "ci-logs/${svc}.log" 2>&1 || true
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml \
+              logs --no-color "${svc}" > "ci-logs/${svc}.log" 2>&1 || true
           done
-          docker compose ${COMPOSE_FILES} ps > ci-logs/ps.txt || true
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml \
+            ps > ci-logs/ps.txt || true
 
       - name: Upload container logs
         if: failure()
@@ -448,7 +447,7 @@ jobs:
       - name: Tear down stack
         if: always()
         run: |
-          docker compose ${COMPOSE_FILES} down -v --remove-orphans
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml down -v --remove-orphans
 
   # ---------------------------------------------------------------
   # Stage 6: deploy
