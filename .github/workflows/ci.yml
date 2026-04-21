@@ -74,6 +74,14 @@ jobs:
       - name: Syntax-check frontend JS
         run: node --check frontend/app.js
 
+      - name: Install ESLint dependencies
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Lint frontend with ESLint
+        working-directory: frontend
+        run: npx eslint .
+
       # hadolint-action runs inside a container and accepts per-file
       # invocations. We loop in a matrix-free step for simplicity.
       - name: Lint Dockerfile — api
