@@ -74,6 +74,14 @@ jobs:
       - name: Syntax-check frontend JS
         run: node --check frontend/app.js
 
+      - name: Install ESLint dependencies
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Lint frontend with ESLint
+        working-directory: frontend
+        run: npx eslint .
+
       # hadolint-action runs inside a container and accepts per-file
       # invocations. We loop in a matrix-free step for simplicity.
       - name: Lint Dockerfile — api
@@ -368,8 +376,6 @@ jobs:
     name: integration-test
     runs-on: ubuntu-latest
     needs: security-scan
-    env:
-      COMPOSE_FILES: "-f docker-compose.yml -f docker-compose.ci.yml"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -385,49 +391,39 @@ jobs:
           docker images
 
       # The compose file uses ${VAR:?...} for REDIS_PASSWORD, so a
-      # .env with a throwaway value is required before `up`.
+      # .env with a value is required before `up`. The password is
+      # generated into a shell variable so no literal credential
+      # material appears in the workflow YAML.
       - name: Create ephemeral .env from example
         run: |
           cp .env.example .env
-          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=ci-$(openssl rand -hex 12)|" .env
+          GENERATED=$(openssl rand -hex 16)
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${GENERATED}|" .env
 
       - name: Bring up stack and wait for healthchecks
         run: |
-          docker compose ${COMPOSE_FILES} up -d --wait --wait-timeout 120
-          docker compose ${COMPOSE_FILES} ps
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --wait --wait-timeout 120
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
 
-      - name: Submit a job and poll until completed
+      - name: Run integration test
+        env:
+          FRONTEND_URL: "http://localhost:${{ env.FRONTEND_PORT || 3000 }}"
+          INTEGRATION_TIMEOUT: "120"
+          POLL_INTERVAL: "2"
         run: |
-          set -euo pipefail
-          FRONTEND="http://localhost:${FRONTEND_PORT:-3000}"
-
-          echo "submitting job..."
-          JOB_ID=$(curl -fsS -X POST "${FRONTEND}/submit" | jq -r .job_id)
-          echo "job_id=${JOB_ID}"
-          [ -n "${JOB_ID}" ] && [ "${JOB_ID}" != "null" ] || { echo "no job id" >&2; exit 1; }
-
-          echo "polling /status/${JOB_ID}..."
-          for i in $(seq 1 60); do
-            STATUS=$(curl -fsS "${FRONTEND}/status/${JOB_ID}" | jq -r .status)
-            echo "  attempt ${i}: status=${STATUS}"
-            case "${STATUS}" in
-              completed) echo "OK"; exit 0 ;;
-              failed|error) echo "job ended in terminal error state" >&2; exit 1 ;;
-            esac
-            sleep 2
-          done
-          echo "timed out after 120s waiting for job to complete" >&2
-          exit 1
+          chmod +x scripts/integration-test.sh
+          bash scripts/integration-test.sh
 
       - name: Dump container logs on failure
         if: failure()
         run: |
           mkdir -p ci-logs
           for svc in redis api worker frontend; do
-            docker compose ${COMPOSE_FILES} logs --no-color "${svc}" \
-              > "ci-logs/${svc}.log" 2>&1 || true
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml \
+              logs --no-color "${svc}" > "ci-logs/${svc}.log" 2>&1 || true
           done
-          docker compose ${COMPOSE_FILES} ps > ci-logs/ps.txt || true
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml \
+            ps > ci-logs/ps.txt || true
 
       - name: Upload container logs
         if: failure()
@@ -440,7 +436,7 @@ jobs:
       - name: Tear down stack
         if: always()
         run: |
-          docker compose ${COMPOSE_FILES} down -v --remove-orphans
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml down -v --remove-orphans
 
   # ---------------------------------------------------------------
   # Stage 6: deploy
@@ -474,7 +470,8 @@ jobs:
       - name: Create .env from example (throwaway for this demo deploy)
         run: |
           cp .env.example .env
-          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=deploy-$(openssl rand -hex 12)|" .env
+          GENERATED=$(openssl rand -hex 16)
+          sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${GENERATED}|" .env
 
       - name: Create shared network and start dependency (redis)
         run: |
